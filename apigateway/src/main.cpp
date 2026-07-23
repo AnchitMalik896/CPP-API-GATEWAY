@@ -1,11 +1,11 @@
 // src/main.cpp
 #include <csignal>
 #include <cstdlib>
-#include <iostream>
 #include <memory>
 #include <thread>
 
 #include "ApiGateway.hpp"
+#include "AsyncLogger.hpp"
 
 namespace {
 
@@ -28,7 +28,8 @@ int main(int argc, char** argv) {
     if (argc > 1) {
         const int parsedPort = std::atoi(argv[1]);
         if (parsedPort <= 0 || parsedPort > 65535) {
-            std::cerr << "Invalid port: " << argv[1] << "\n";
+            apigateway::AsyncLogger::instance().error(
+                std::string("Invalid port: ") + argv[1]);
             return EXIT_FAILURE;
         }
         port = static_cast<uint16_t>(parsedPort);
@@ -51,7 +52,8 @@ int main(int argc, char** argv) {
         router.get("/api/v1/users/:id", [](const apigateway::RouteParams& params) {
             auto it = params.find("id");
             if (it != params.end()) {
-                std::cout << "[handler] Fetching user id=" << it->second << "\n";
+                apigateway::AsyncLogger::instance().info(
+                    "Fetching user id=" + it->second);
             }
         });
 
@@ -64,22 +66,25 @@ int main(int argc, char** argv) {
         router.get("/api/v1/orders/:id", [](const apigateway::RouteParams& params) {
             auto it = params.find("id");
             if (it != params.end()) {
-                std::cout << "[handler] Fetching order id=" << it->second << "\n";
+                apigateway::AsyncLogger::instance().info(
+                    "Fetching order id=" + it->second);
             }
         });
 
         router.post("/api/v1/orders", [](const apigateway::RouteParams&) {
         });
 
-        std::cout << "API Gateway listening on port " << port
-                  << " (thread pool size: " << threadPoolSize << ")\n";
+        apigateway::AsyncLogger::instance().info(
+            "API Gateway starting on port " + std::to_string(port) +
+            " (thread pool size: " + std::to_string(threadPoolSize) + ")");
 
         g_gateway->run();
     } catch (const std::exception& ex) {
-        std::cerr << "Fatal error: " << ex.what() << "\n";
+        apigateway::AsyncLogger::instance().error(
+            std::string("Fatal error: ") + ex.what());
         return EXIT_FAILURE;
     }
 
-    std::cout << "API Gateway shut down cleanly.\n";
+    apigateway::AsyncLogger::instance().info("API Gateway shut down cleanly.");
     return EXIT_SUCCESS;
 }

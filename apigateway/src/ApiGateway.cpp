@@ -1,5 +1,6 @@
 // src/ApiGateway.cpp
 #include "ApiGateway.hpp"
+#include "AsyncLogger.hpp"
 #include "Socket.hpp"
 
 #include <algorithm>
@@ -151,6 +152,7 @@ void ApiGateway::run() {
 }
 
 void ApiGateway::stop() noexcept {
+    AsyncLogger::instance().info("ApiGateway shutdown requested");
     running_.store(false, std::memory_order_relaxed);
     triggerWake();
 }
@@ -173,6 +175,7 @@ void ApiGateway::onListenReadable() {
 
         auto conn = std::make_unique<Connection>();
         conn->fd = clientFd;
+        conn->requestId = generateRequestId();
         connections_[clientFd] = std::move(conn);
 
         registerEvent(clientFd, EVFILT_READ, EV_ADD | EV_ENABLE);
@@ -200,6 +203,10 @@ void ApiGateway::onConnectionReadable(int fd) {
             conn.readBuffer.append(buffer.data(), static_cast<size_t>(bytesRead));
 
             if (conn.readBuffer.size() > kMaxHeaderSectionLength + kMaxBodyLength) {
+                ScopedRequestId scopedId(conn.requestId);
+                AsyncLogger::instance().warn(
+                    "payload too large, fd=" + std::to_string(fd));
+
                 conn.writeBuffer = buildResponse(413, "Payload Too Large",
                                                   "Request exceeds maximum allowed size",
                                                   "text/plain; charset=utf-8");
@@ -213,7 +220,12 @@ void ApiGateway::onConnectionReadable(int fd) {
             std::optional<ParsedRequestView> parsed;
             try {
                 parsed = tryParseRequest(conn.readBuffer, consumedBytes);
-            } catch (const std::invalid_argument&) {
+            } catch (const std::invalid_argument& ex) {
+                ScopedRequestId scopedId(conn.requestId);
+                AsyncLogger::instance().warn(
+                    std::string("malformed request, fd=") + std::to_string(fd) +
+                    " reason=" + ex.what());
+
                 conn.writeBuffer = buildResponse(400, "Bad Request",
                                                   "Malformed HTTP request",
                                                   "text/plain; charset=utf-8");
@@ -231,7 +243,7 @@ void ApiGateway::onConnectionReadable(int fd) {
                 std::string ownedBuffer = std::move(conn.readBuffer);
                 conn.readBuffer.clear();
 
-                dispatchToThreadPool(fd, *parsed, std::move(ownedBuffer));
+                dispatchToThreadPool(fd, conn.requestId, *parsed, std::move(ownedBuffer));
                 return;
             }
 
@@ -392,8 +404,9 @@ std::optional<ApiGateway::ParsedRequestView> ApiGateway::tryParseRequest(
 
 
 
-void ApiGateway::dispatchToThreadPool(int fd, ParsedRequestView request, std::string ownedBuffer) {
-  
+void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, ParsedRequestView request,
+                                       std::string ownedBuffer) {
+
     const std::string_view originalRaw(ownedBuffer);
     const size_t pathOffset = static_cast<size_t>(request.path.data() - originalRaw.data());
     const size_t pathLen = request.path.size();
@@ -407,7 +420,13 @@ void ApiGateway::dispatchToThreadPool(int fd, ParsedRequestView request, std::st
     const HttpMethod method = request.method;
 
     threadPool_.enqueue([this, fd, method, pathOffset, pathLen, queryOffset, queryLen,
-                          bodyOffset, bodyLen, buffer = std::move(ownedBuffer)]() mutable {
+                          bodyOffset, bodyLen, requestId = std::move(requestId),
+                          buffer = std::move(ownedBuffer)]() mutable {
+        // Correlates every log line produced while handling this request
+        // -- including inside the route handler itself -- without any
+        // change to Router::RouteHandler's signature.
+        ScopedRequestId scopedId(requestId);
+
         const std::string_view raw(buffer);
         const std::string_view path = raw.substr(pathOffset, pathLen);
         const std::string_view query = (queryLen > 0) ? raw.substr(queryOffset, queryLen)
@@ -420,6 +439,7 @@ void ApiGateway::dispatchToThreadPool(int fd, ParsedRequestView request, std::st
         std::string responseBytes;
 
         if (!rateLimiter_.tryAcquire()) {
+            AsyncLogger::instance().warn("rate limit exceeded, path=" + std::string(path));
             responseBytes = buildResponse(429, "Too Many Requests",
                                            "Rate limit exceeded. Please try again later.",
                                            "text/plain; charset=utf-8");
@@ -428,6 +448,7 @@ void ApiGateway::dispatchToThreadPool(int fd, ParsedRequestView request, std::st
             const RouteMatch match = router_.match(method, std::string(path));
 
             if (!match.found) {
+                AsyncLogger::instance().info("no route matched, path=" + std::string(path));
                 responseBytes = buildResponse(404, "Not Found",
                                                "No route matches this path/method.",
                                                "text/plain; charset=utf-8");
@@ -449,6 +470,8 @@ void ApiGateway::dispatchToThreadPool(int fd, ParsedRequestView request, std::st
                 json << "}}";
 
                 responseBytes = buildResponse(200, "OK", json.str(), "application/json");
+                AsyncLogger::instance().info(
+                    "response ready, path=" + std::string(path) + " status=200");
             }
         }
 
@@ -545,4 +568,4 @@ std::string ApiGateway::buildResponse(int statusCode,
     return response.str();
 }
 
-} 
+}

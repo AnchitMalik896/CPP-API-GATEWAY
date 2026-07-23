@@ -39,6 +39,7 @@ private:
         bool headerParsed = false;
         size_t headerBytesConsumed = 0;
         size_t contentLength = 0;
+        std::string requestId; // assigned on accept; correlates all log lines for this request
     };
 
     
@@ -78,7 +79,8 @@ private:
                                       std::string_view body,
                                       std::string_view contentType);
 
-    void dispatchToThreadPool(int fd, ParsedRequestView request, std::string ownedBuffer);
+    void dispatchToThreadPool(int fd, std::string requestId, ParsedRequestView request,
+                               std::string ownedBuffer);
 
     uint16_t port_;
     int kq_;
@@ -95,4 +97,4 @@ private:
     std::queue<CompletionResult> completionQueue_;
 };
 
-} 
+}
