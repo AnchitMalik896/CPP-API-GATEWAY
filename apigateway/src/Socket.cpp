@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
+#include <string>   
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>

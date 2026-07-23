@@ -1,4 +1,0 @@
-/Users/anchitmalik/codes/cpp-api-gateway/apigateway/build/CMakeFiles/apigateway_core.dir
-/Users/anchitmalik/codes/cpp-api-gateway/apigateway/build/CMakeFiles/apigateway.dir
-/Users/anchitmalik/codes/cpp-api-gateway/apigateway/build/CMakeFiles/edit_cache.dir
-/Users/anchitmalik/codes/cpp-api-gateway/apigateway/build/CMakeFiles/rebuild_cache.dir

@@ -1,2 +1,0 @@
-/usr/bin/ar qc libapigateway_core.a CMakeFiles/apigateway_core.dir/src/RateLimiter.cpp.o CMakeFiles/apigateway_core.dir/src/Router.cpp.o CMakeFiles/apigateway_core.dir/src/Socket.cpp.o CMakeFiles/apigateway_core.dir/src/EventLoop.cpp.o CMakeFiles/apigateway_core.dir/src/HttpParser.cpp.o CMakeFiles/apigateway_core.dir/src/HttpServer.cpp.o
-/usr/bin/ranlib libapigateway_core.a
