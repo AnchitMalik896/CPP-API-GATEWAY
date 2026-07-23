@@ -20,7 +20,7 @@ namespace {
     throw std::runtime_error(std::string(what) + ": " + std::strerror(err));
 }
 
-} // namespace
+} 
 
 int Socket::createListeningSocket(uint16_t port, int backlog) {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -89,4 +89,4 @@ void Socket::closeSocket(int fd) noexcept {
     }
 }
 
-} // namespace apigateway
+} 

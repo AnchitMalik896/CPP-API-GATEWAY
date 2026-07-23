@@ -5,9 +5,6 @@
 
 namespace apigateway {
 
-// ---------------------------------------------------------------------------
-// HttpMethod helpers
-// ---------------------------------------------------------------------------
 
 HttpMethod httpMethodFromString(std::string_view method) {
     if (method == "GET")     return HttpMethod::GET;
@@ -33,9 +30,7 @@ std::string_view httpMethodToString(HttpMethod method) noexcept {
     return "UNKNOWN";
 }
 
-// ---------------------------------------------------------------------------
-// Trie node
-// ---------------------------------------------------------------------------
+
 
 struct Router::TrieNode {
     std::unordered_map<std::string, std::unique_ptr<TrieNode>> children;
@@ -44,18 +39,13 @@ struct Router::TrieNode {
     std::unordered_map<HttpMethod, RouteHandler> handlers;
 };
 
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
 
 Router::Router()  : root_(std::make_unique<TrieNode>()) {}
 Router::~Router() = default;
 Router::Router(Router&&) noexcept            = default;
 Router& Router::operator=(Router&&) noexcept = default;
 
-// ---------------------------------------------------------------------------
-// Path splitting
-// ---------------------------------------------------------------------------
+
 
 std::vector<std::string_view> Router::splitPath(std::string_view path) {
     std::vector<std::string_view> segments;
@@ -86,9 +76,7 @@ std::vector<std::string_view> Router::splitPath(std::string_view path) {
     return segments;
 }
 
-// ---------------------------------------------------------------------------
-// Registration
-// ---------------------------------------------------------------------------
+
 
 void Router::addRoute(HttpMethod method, const std::string& path, RouteHandler handler) {
     if (!handler) {
@@ -151,9 +139,7 @@ void Router::patch(const std::string& path, RouteHandler handler) {
     addRoute(HttpMethod::PATCH,  path, std::move(handler));
 }
 
-// ---------------------------------------------------------------------------
-// Matching
-// ---------------------------------------------------------------------------
+
 
 RouteMatch Router::match(HttpMethod method, const std::string& path) const {
     RouteMatch result;
@@ -196,4 +182,4 @@ RouteMatch Router::match(HttpMethod method, const std::string& path) const {
     return result;
 }
 
-} // namespace apigateway
+} 
