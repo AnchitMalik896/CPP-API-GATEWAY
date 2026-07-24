@@ -1,9 +1,10 @@
+// src/Socket.cpp
 #include "Socket.hpp"
 
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
-#include <string>   
+#include <string>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -20,7 +21,7 @@ namespace {
     throw std::runtime_error(std::string(what) + ": " + std::strerror(err));
 }
 
-} 
+}
 
 int Socket::createListeningSocket(uint16_t port, int backlog) {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -40,9 +41,9 @@ int Socket::createListeningSocket(uint16_t port, int backlog) {
     (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
 
     sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
+    addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(port);
+    addr.sin_port = htons(port);
 
     if (::bind(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) < 0) {
         const int err = errno;
@@ -60,6 +61,48 @@ int Socket::createListeningSocket(uint16_t port, int backlog) {
 
     setNonBlocking(fd);
     disableSigPipe(fd);
+
+    return fd;
+}
+
+int Socket::createConnectingSocket(const std::string& ip, uint16_t port) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        throwErrno("socket() failed");
+    }
+
+    setNonBlocking(fd);
+    disableSigPipe(fd);
+
+    const int noDelay = 1;
+    (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+
+    const int ptonResult = ::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+    if (ptonResult == 0) {
+        const int err = errno;
+        ::close(fd);
+        errno = err;
+        throw std::invalid_argument("createConnectingSocket: not a valid IPv4 address: " + ip);
+    }
+    if (ptonResult < 0) {
+        const int err = errno;
+        ::close(fd);
+        errno = err;
+        throwErrno("inet_pton() failed");
+    }
+
+    if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) < 0) {
+        if (errno != EINPROGRESS) {
+            const int err = errno;
+            ::close(fd);
+            errno = err;
+            throwErrno("connect() failed");
+        }
+    }
 
     return fd;
 }
