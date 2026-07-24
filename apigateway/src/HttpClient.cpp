@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <utility>
 
 namespace apigateway {
 
@@ -21,8 +22,6 @@ constexpr size_t kMaxHeaderSectionLength = 32 * 1024;
 constexpr size_t kMaxBodySize = 10 * 1024 * 1024;
 constexpr size_t kMaxResponseSize = kMaxHeaderSectionLength + kMaxBodySize;
 constexpr size_t kReadChunkSize = 16 * 1024;
-
-
 
 std::string_view trimView(std::string_view s) noexcept {
     size_t begin = 0;
@@ -50,6 +49,8 @@ bool caseInsensitiveEquals(std::string_view a, std::string_view b) noexcept {
 }
 
 } 
+
+
 HttpClient::HttpClient() = default;
 
 HttpClient::~HttpClient() {
@@ -80,6 +81,7 @@ void HttpClient::fail(std::string_view reason) noexcept {
     AsyncLogger::instance().error(reason);
 }
 
+
 int HttpClient::connect(const std::string& ip, uint16_t port) {
     if (state_ != HttpClientState::NotConnected) {
         throw std::logic_error("HttpClient::connect() called from an invalid state");
@@ -102,6 +104,29 @@ int HttpClient::connect(const std::string& ip, uint16_t port) {
         "HttpClient: connecting to " + remoteHostHeader_ + " (fd=" + std::to_string(fd_) + ")");
 
     return fd_;
+}
+
+bool HttpClient::adoptConnection(int fd, std::string remoteHostHeader) noexcept {
+    if (state_ != HttpClientState::NotConnected &&
+        state_ != HttpClientState::Complete &&
+        state_ != HttpClientState::Failed) {
+        return false;
+    }
+
+    if (fd_ >= 0 && fd_ != fd) {
+        Socket::closeSocket(fd_);
+    }
+
+    fd_ = fd;
+    remoteHostHeader_ = std::move(remoteHostHeader);
+    writeBuffer_.clear();
+    writeBuffer_.shrink_to_fit();
+    writeOffset_ = 0;
+    readBuffer_.clear();
+    readBuffer_.shrink_to_fit();
+    response_ = HttpClientResponse{};
+    state_ = HttpClientState::Connected;
+    return true;
 }
 
 bool HttpClient::completeConnect() {
@@ -189,7 +214,7 @@ bool HttpClient::send() {
         }
 
         if (bytesSent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return true; 
+            return true;
         }
         if (bytesSent < 0 && errno == EINTR) {
             continue;
@@ -204,6 +229,7 @@ bool HttpClient::send() {
     state_ = HttpClientState::Receiving;
     return true;
 }
+
 
 
 bool HttpClient::receive() {
@@ -267,6 +293,8 @@ bool HttpClient::receive() {
         return false;
     }
 }
+
+
 
 bool HttpClient::tryParseResponse() {
     const std::string_view raw(readBuffer_);
@@ -340,6 +368,7 @@ bool HttpClient::tryParseResponse() {
         }
         lineStart = lineEnd + 2;
     }
+
     size_t contentLength = 0;
     for (const auto& [key, value] : headers) {
         if (caseInsensitiveEquals(key, "content-length")) {
@@ -374,4 +403,14 @@ bool HttpClient::tryParseResponse() {
     return true;
 }
 
-} 
+int HttpClient::releaseFd() noexcept {
+    if (fd_ < 0) {
+        return -1;
+    }
+    const int released = fd_;
+    fd_ = -1;
+    state_ = HttpClientState::NotConnected;
+    return released;
+}
+
+}

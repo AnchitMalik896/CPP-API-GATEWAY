@@ -1,9 +1,12 @@
+// src/Router.cpp
 #include "Router.hpp"
 
 #include <algorithm>
 #include <stdexcept>
+#include <utility>
 
 namespace apigateway {
+
 
 
 HttpMethod httpMethodFromString(std::string_view method) {
@@ -31,12 +34,21 @@ std::string_view httpMethodToString(HttpMethod method) noexcept {
 }
 
 
+namespace {
+
+
+struct RouteEntry {
+    RouteHandler handler;
+    std::optional<ProxyTarget> proxyTarget;
+};
+
+} 
 
 struct Router::TrieNode {
     std::unordered_map<std::string, std::unique_ptr<TrieNode>> children;
     std::unique_ptr<TrieNode> paramChild;
     std::string               paramName;
-    std::unordered_map<HttpMethod, RouteHandler> handlers;
+    std::unordered_map<HttpMethod, RouteEntry> handlers;
 };
 
 
@@ -78,11 +90,7 @@ std::vector<std::string_view> Router::splitPath(std::string_view path) {
 
 
 
-void Router::addRoute(HttpMethod method, const std::string& path, RouteHandler handler) {
-    if (!handler) {
-        throw std::invalid_argument("Route handler must not be empty for path: " + path);
-    }
-
+Router::TrieNode* Router::resolveOrCreateNode(const std::string& path) {
     const std::vector<std::string_view> segments = splitPath(path);
 
     TrieNode* current = root_.get();
@@ -114,13 +122,47 @@ void Router::addRoute(HttpMethod method, const std::string& path, RouteHandler h
         }
     }
 
+    return current;
+}
+
+
+void Router::addRoute(HttpMethod method, const std::string& path, RouteHandler handler) {
+    if (!handler) {
+        throw std::invalid_argument("Route handler must not be empty for path: " + path);
+    }
+
+    TrieNode* current = resolveOrCreateNode(path);
+
     if (current->handlers.count(method) > 0) {
         throw std::invalid_argument(
             "Duplicate route registration for method " +
             std::string(httpMethodToString(method)) + " on path: " + path);
     }
 
-    current->handlers.emplace(method, std::move(handler));
+    current->handlers.emplace(method, RouteEntry{std::move(handler), std::nullopt});
+}
+
+void Router::addProxyRoute(HttpMethod method, const std::string& path,
+                            std::string upstreamHost, uint16_t upstreamPort) {
+    if (upstreamHost.empty()) {
+        throw std::invalid_argument("Proxy route upstream host must not be empty for path: " + path);
+    }
+
+    TrieNode* current = resolveOrCreateNode(path);
+
+    if (current->handlers.count(method) > 0) {
+        throw std::invalid_argument(
+            "Duplicate route registration for method " +
+            std::string(httpMethodToString(method)) + " on path: " + path);
+    }
+
+    ProxyTarget target{std::move(upstreamHost), upstreamPort};
+    current->handlers.emplace(method, RouteEntry{nullptr, std::move(target)});
+}
+
+void Router::proxy(HttpMethod method, const std::string& path,
+                    std::string upstreamHost, uint16_t upstreamPort) {
+    addProxyRoute(method, path, std::move(upstreamHost), upstreamPort);
 }
 
 void Router::get(const std::string& path, RouteHandler handler) {
@@ -176,9 +218,10 @@ RouteMatch Router::match(HttpMethod method, const std::string& path) const {
         return result;
     }
 
-    result.found   = true;
-    result.handler = handlerIt->second;
-    result.params  = std::move(params);
+    result.found       = true;
+    result.handler      = handlerIt->second.handler;
+    result.params        = std::move(params);
+    result.proxyTarget  = handlerIt->second.proxyTarget;
     return result;
 }
 

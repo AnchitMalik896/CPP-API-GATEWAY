@@ -1,7 +1,10 @@
+// include/Router.hpp
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -25,10 +28,16 @@ std::string_view httpMethodToString(HttpMethod method) noexcept;
 using RouteParams  = std::unordered_map<std::string, std::string>;
 using RouteHandler = std::function<void(const RouteParams& params)>;
 
+struct ProxyTarget {
+    std::string host;
+    uint16_t    port = 0;
+};
+
 struct RouteMatch {
     bool         found = false;
     RouteHandler handler;
     RouteParams  params;
+    std::optional<ProxyTarget> proxyTarget;
 };
 
 class Router {
@@ -49,6 +58,13 @@ public:
     void del(const std::string& path, RouteHandler handler);
     void patch(const std::string& path, RouteHandler handler);
 
+   
+    void addProxyRoute(HttpMethod method, const std::string& path,
+                        std::string upstreamHost, uint16_t upstreamPort);
+
+    void proxy(HttpMethod method, const std::string& path,
+               std::string upstreamHost, uint16_t upstreamPort);
+
     [[nodiscard]] RouteMatch match(HttpMethod method, const std::string& path) const;
 
 private:
@@ -56,7 +72,10 @@ private:
 
     static std::vector<std::string_view> splitPath(std::string_view path);
 
+   
+    TrieNode* resolveOrCreateNode(const std::string& path);
+
     std::unique_ptr<TrieNode> root_;
 };
 
-} // namespace apigateway
+} 

@@ -43,26 +43,35 @@ public:
     [[nodiscard]] HttpClientState state() const noexcept;
     [[nodiscard]] int fd() const noexcept;
 
-   
+    
     int connect(const std::string& ip, uint16_t port);
+
+    bool adoptConnection(int fd, std::string remoteHostHeader) noexcept;
+
     bool completeConnect();
 
+    
     void prepareRequest(HttpMethod method,
                          std::string_view path,
                          const std::unordered_map<std::string, std::string>& headers,
                          std::string_view body = {});
 
-    
+   
     bool send();
+
     bool receive();
 
+    
     [[nodiscard]] const HttpClientResponse& response() const noexcept;
 
+    int releaseFd() noexcept;
 
     void close() noexcept;
 
 private:
+   
     bool tryParseResponse();
+
     void fail(std::string_view reason) noexcept;
 
     int fd_ = -1;
