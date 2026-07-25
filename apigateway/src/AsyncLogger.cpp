@@ -76,12 +76,17 @@ AsyncLogger::~AsyncLogger() {
         worker_.join();
     }
 
-    // The background thread is gone -- drain whatever it didn't get to
-    // synchronously so no log line is lost at process exit.
-    writeRecords(buffers_[0]);
-    writeRecords(buffers_[1]);
-    buffers_[0].clear();
-    buffers_[1].clear();
+    std::vector<LogRecord> remaining0;
+    std::vector<LogRecord> remaining1;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        remaining0 = std::move(buffers_[0]);
+        remaining1 = std::move(buffers_[1]);
+        buffers_[0].clear();
+        buffers_[1].clear();
+    }
+    writeRecords(remaining0);
+    writeRecords(remaining1);
 }
 
 void AsyncLogger::setLogFile(const std::string& path) {

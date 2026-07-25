@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -43,7 +44,8 @@ private:
     size_t maxIdlePerHost_;
     std::chrono::seconds idleTimeout_;
 
+    mutable std::mutex mutex_;
     std::unordered_map<std::string, std::vector<PooledConnection>> idleByHost_;
 };
 
-} 
+}

@@ -240,10 +240,28 @@ void ApiGateway::onConnectionReadable(int fd) {
                 conn.awaitingCompletion = true;
                 registerEvent(fd, EVFILT_READ, EV_DELETE);
 
+                const std::string_view originalRaw(conn.readBuffer);
+                const size_t pathOffset =
+                    static_cast<size_t>(parsed->path.data() - originalRaw.data());
+                const size_t pathLen = parsed->path.size();
+                const size_t queryOffset =
+                    parsed->query.empty()
+                        ? 0
+                        : static_cast<size_t>(parsed->query.data() - originalRaw.data());
+                const size_t queryLen = parsed->query.size();
+                const size_t bodyOffset =
+                    parsed->body.empty()
+                        ? conn.readBuffer.size()
+                        : static_cast<size_t>(parsed->body.data() - originalRaw.data());
+                const size_t bodyLen = parsed->body.size();
+                const HttpMethod method = parsed->method;
+
                 std::string ownedBuffer = std::move(conn.readBuffer);
                 conn.readBuffer.clear();
 
-                dispatchToThreadPool(fd, conn.requestId, *parsed, std::move(ownedBuffer));
+                dispatchToThreadPool(fd, conn.requestId, method,
+                                      pathOffset, pathLen, queryOffset, queryLen,
+                                      bodyOffset, bodyLen, std::move(ownedBuffer));
                 return;
             }
 
@@ -404,27 +422,15 @@ std::optional<ApiGateway::ParsedRequestView> ApiGateway::tryParseRequest(
 
 
 
-void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, ParsedRequestView request,
+void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, HttpMethod method,
+                                       size_t pathOffset, size_t pathLen,
+                                       size_t queryOffset, size_t queryLen,
+                                       size_t bodyOffset, size_t bodyLen,
                                        std::string ownedBuffer) {
-
-    const std::string_view originalRaw(ownedBuffer);
-    const size_t pathOffset = static_cast<size_t>(request.path.data() - originalRaw.data());
-    const size_t pathLen = request.path.size();
-    const size_t queryOffset =
-        request.query.empty() ? 0 : static_cast<size_t>(request.query.data() - originalRaw.data());
-    const size_t queryLen = request.query.size();
-    const size_t bodyOffset =
-        request.body.empty() ? originalRaw.size()
-                              : static_cast<size_t>(request.body.data() - originalRaw.data());
-    const size_t bodyLen = request.body.size();
-    const HttpMethod method = request.method;
 
     threadPool_.enqueue([this, fd, method, pathOffset, pathLen, queryOffset, queryLen,
                           bodyOffset, bodyLen, requestId = std::move(requestId),
                           buffer = std::move(ownedBuffer)]() mutable {
-        // Correlates every log line produced while handling this request
-        // -- including inside the route handler itself -- without any
-        // change to Router::RouteHandler's signature.
         ScopedRequestId scopedId(requestId);
 
         const std::string_view raw(buffer);

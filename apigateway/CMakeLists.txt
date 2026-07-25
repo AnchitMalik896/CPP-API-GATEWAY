@@ -1,4 +1,3 @@
-# CMakeLists.txt
 cmake_minimum_required(VERSION 3.20)
 project(ApiGateway VERSION 0.1.0 LANGUAGES CXX)
 
@@ -50,7 +49,6 @@ target_link_options(apigateway_options INTERFACE
     $<$<CONFIG:Debug>:-fsanitize=address,undefined>
 )
 
-
 set(APIGATEWAY_CORE_SOURCES
     src/RateLimiter.cpp
     src/Router.cpp
@@ -62,6 +60,7 @@ set(APIGATEWAY_CORE_SOURCES
     src/ApiGateway.cpp
     src/AsyncLogger.cpp
     src/HttpClient.cpp
+    src/ConnectionPool.cpp
 )
 
 add_library(apigateway_core STATIC ${APIGATEWAY_CORE_SOURCES})
@@ -79,7 +78,6 @@ target_link_libraries(apigateway_core
 
 find_package(Threads REQUIRED)
 target_link_libraries(apigateway_core PUBLIC Threads::Threads)
-
 
 add_executable(apigateway src/main.cpp)
 target_link_libraries(apigateway PRIVATE apigateway_core)

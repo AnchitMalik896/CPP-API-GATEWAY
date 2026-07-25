@@ -79,7 +79,10 @@ private:
                                       std::string_view body,
                                       std::string_view contentType);
 
-    void dispatchToThreadPool(int fd, std::string requestId, ParsedRequestView request,
+    void dispatchToThreadPool(int fd, std::string requestId, HttpMethod method,
+                               size_t pathOffset, size_t pathLen,
+                               size_t queryOffset, size_t queryLen,
+                               size_t bodyOffset, size_t bodyLen,
                                std::string ownedBuffer);
 
     uint16_t port_;

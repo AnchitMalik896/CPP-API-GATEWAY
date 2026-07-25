@@ -19,6 +19,7 @@ ConnectionPool::~ConnectionPool() {
 
 bool ConnectionPool::isHealthy(int fd) noexcept {
     char probe = 0;
+    errno = 0;
     const ssize_t result = ::recv(fd, &probe, 1, MSG_PEEK);
 
     if (result > 0) {
@@ -31,6 +32,8 @@ bool ConnectionPool::isHealthy(int fd) noexcept {
 }
 
 int ConnectionPool::lease(const std::string& hostKey) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
     auto it = idleByHost_.find(hostKey);
     if (it == idleByHost_.end()) {
         return -1;
@@ -57,6 +60,8 @@ void ConnectionPool::release(const std::string& hostKey, int fd) {
         return;
     }
 
+    std::lock_guard<std::mutex> lock(mutex_);
+
     std::vector<PooledConnection>& idle = idleByHost_[hostKey];
 
     if (idle.size() >= maxIdlePerHost_) {
@@ -78,6 +83,8 @@ void ConnectionPool::discard(int fd) noexcept {
 }
 
 void ConnectionPool::reapStale() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
     const auto now = std::chrono::steady_clock::now();
 
     for (auto& [hostKey, idle] : idleByHost_) {
@@ -96,6 +103,8 @@ void ConnectionPool::reapStale() {
 }
 
 void ConnectionPool::closeAll() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+
     for (auto& [hostKey, idle] : idleByHost_) {
         (void)hostKey;
         for (const PooledConnection& conn : idle) {
@@ -106,6 +115,8 @@ void ConnectionPool::closeAll() noexcept {
 }
 
 size_t ConnectionPool::idleConnectionCount() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+
     size_t total = 0;
     for (const auto& [hostKey, idle] : idleByHost_) {
         (void)hostKey;
@@ -114,4 +125,4 @@ size_t ConnectionPool::idleConnectionCount() const noexcept {
     return total;
 }
 
-} 
+}
