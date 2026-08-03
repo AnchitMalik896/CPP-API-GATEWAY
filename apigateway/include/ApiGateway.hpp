@@ -1,6 +1,6 @@
-// include/ApiGateway.hpp
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -10,6 +10,8 @@
 #include <string_view>
 #include <unordered_map>
 
+#include "ConnectionPool.hpp"
+#include "ProxyManager.hpp"
 #include "RateLimiter.hpp"
 #include "Router.hpp"
 #include "ThreadPool.hpp"
@@ -39,7 +41,7 @@ private:
         bool headerParsed = false;
         size_t headerBytesConsumed = 0;
         size_t contentLength = 0;
-        std::string requestId; // assigned on accept; correlates all log lines for this request
+        std::string requestId; 
     };
 
     
@@ -79,11 +81,13 @@ private:
                                       std::string_view body,
                                       std::string_view contentType);
 
+   
     void dispatchToThreadPool(int fd, std::string requestId, HttpMethod method,
                                size_t pathOffset, size_t pathLen,
                                size_t queryOffset, size_t queryLen,
                                size_t bodyOffset, size_t bodyLen,
-                               std::string ownedBuffer);
+                               std::string ownedBuffer,
+                               std::unordered_map<std::string, std::string> headers);
 
     uint16_t port_;
     int kq_;
@@ -93,6 +97,8 @@ private:
     Router router_;
     RateLimiter rateLimiter_;
     ThreadPool threadPool_;
+    ConnectionPool connectionPool_;
+    ProxyManager proxyManager_;
 
     std::unordered_map<int, std::unique_ptr<Connection>> connections_;
 

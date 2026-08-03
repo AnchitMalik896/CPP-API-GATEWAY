@@ -7,6 +7,7 @@
 #include <array>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <netinet/in.h>
 #include <sstream>
@@ -26,6 +27,13 @@ constexpr int kMaxEventsPerPoll = 256;
 constexpr long kPollTimeoutNanos = 250'000'000L; 
 
 constexpr uintptr_t kWakeIdent = 1;
+
+// Pooled upstream connections: how many idle connections we keep around
+// per upstream host:port, and how long an idle connection may sit
+// before ConnectionPool::reapStale() (if wired up by the caller) or a
+// health probe on lease() considers it stale.
+constexpr size_t kProxyMaxIdlePerHost = 16;
+constexpr std::chrono::seconds kProxyIdleTimeout{60};
 
 std::string_view trimView(std::string_view s) noexcept {
     size_t begin = 0;
@@ -47,7 +55,9 @@ ApiGateway::ApiGateway(uint16_t port, size_t threadPoolSize)
     , kq_(kqueue())
     , listenFd_(-1)
     , rateLimiter_(/*capacity=*/500, /*refillRatePerSecond=*/250)
-    , threadPool_(threadPoolSize) {
+    , threadPool_(threadPoolSize)
+    , connectionPool_(kProxyMaxIdlePerHost, kProxyIdleTimeout)
+    , proxyManager_(connectionPool_) {
     if (kq_ < 0) {
         throw std::runtime_error(std::string("kqueue() failed: ") + std::strerror(errno));
     }
@@ -256,12 +266,24 @@ void ApiGateway::onConnectionReadable(int fd) {
                 const size_t bodyLen = parsed->body.size();
                 const HttpMethod method = parsed->method;
 
+                // Copy the headers out into owned storage *before* the
+                // buffer they view into is moved below. This is the only
+                // extra state the proxy path needs: everything else
+                // (path/query/body) is still reachable via offsets into
+                // the moved buffer.
+                std::unordered_map<std::string, std::string> headersOwned;
+                headersOwned.reserve(parsed->headers.size());
+                for (const auto& [key, value] : parsed->headers) {
+                    headersOwned.emplace(std::string(key), std::string(value));
+                }
+
                 std::string ownedBuffer = std::move(conn.readBuffer);
                 conn.readBuffer.clear();
 
                 dispatchToThreadPool(fd, conn.requestId, method,
                                       pathOffset, pathLen, queryOffset, queryLen,
-                                      bodyOffset, bodyLen, std::move(ownedBuffer));
+                                      bodyOffset, bodyLen, std::move(ownedBuffer),
+                                      std::move(headersOwned));
                 return;
             }
 
@@ -426,11 +448,13 @@ void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, HttpMethod 
                                        size_t pathOffset, size_t pathLen,
                                        size_t queryOffset, size_t queryLen,
                                        size_t bodyOffset, size_t bodyLen,
-                                       std::string ownedBuffer) {
+                                       std::string ownedBuffer,
+                                       std::unordered_map<std::string, std::string> headers) {
 
     threadPool_.enqueue([this, fd, method, pathOffset, pathLen, queryOffset, queryLen,
                           bodyOffset, bodyLen, requestId = std::move(requestId),
-                          buffer = std::move(ownedBuffer)]() mutable {
+                          buffer = std::move(ownedBuffer),
+                          headers = std::move(headers)]() mutable {
         ScopedRequestId scopedId(requestId);
 
         const std::string_view raw(buffer);
@@ -439,8 +463,6 @@ void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, HttpMethod 
                                                        : std::string_view{};
         const std::string_view body = (bodyLen > 0) ? raw.substr(bodyOffset, bodyLen)
                                                      : std::string_view{};
-        (void)query;
-        (void)body;
 
         std::string responseBytes;
 
@@ -458,6 +480,11 @@ void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, HttpMethod 
                 responseBytes = buildResponse(404, "Not Found",
                                                "No route matches this path/method.",
                                                "text/plain; charset=utf-8");
+            } else if (match.proxyTarget.has_value()) {
+                responseBytes = proxyManager_.forward(*match.proxyTarget, method, path, query,
+                                                       headers, body, requestId);
+                AsyncLogger::instance().info(
+                    "response ready (proxied), path=" + std::string(path));
             } else {
                 if (match.handler) {
                     match.handler(match.params);

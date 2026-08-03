@@ -61,6 +61,7 @@ set(APIGATEWAY_CORE_SOURCES
     src/AsyncLogger.cpp
     src/HttpClient.cpp
     src/ConnectionPool.cpp
+    src/ProxyManager.cpp
 )
 
 add_library(apigateway_core STATIC ${APIGATEWAY_CORE_SOURCES})

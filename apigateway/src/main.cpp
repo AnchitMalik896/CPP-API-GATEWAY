@@ -74,6 +74,12 @@ int main(int argc, char** argv) {
         router.post("/api/v1/orders", [](const apigateway::RouteParams&) {
         });
 
+        router.proxy(
+            apigateway::HttpMethod::GET,
+            "/proxy",
+            "127.0.0.1",
+            9000
+        );
         apigateway::AsyncLogger::instance().info(
             "API Gateway starting on port " + std::to_string(port) +
             " (thread pool size: " + std::to_string(threadPoolSize) + ")");
