@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -20,6 +21,9 @@ namespace apigateway {
 class ApiGateway {
 public:
     ApiGateway(uint16_t port, size_t threadPoolSize);
+
+    // Must not run concurrently with run(). Joins every worker thread
+    // before any state the workers use is destroyed or closed.
     ~ApiGateway();
 
     ApiGateway(const ApiGateway&) = delete;
@@ -28,7 +32,12 @@ public:
     ApiGateway& operator=(ApiGateway&&) = delete;
     Router& router() noexcept;
     RateLimiter& rateLimiter() noexcept;
+
+    // Runs the reactor until stop() is called or SIGINT/SIGTERM is
+    // delivered through the kqueue (EVFILT_SIGNAL).
     void run();
+
+    // Thread-safe; not async-signal-safe (it logs).
     void stop() noexcept;
 
 private:
@@ -61,6 +70,10 @@ private:
     };
 
     void setupReactorWakeChannel();
+    void setupSignalHandling();
+    void restoreSignalDispositions() noexcept;
+    void onShutdownSignal(int signalNumber);
+    void teardown() noexcept;
     void registerEvent(int fd, int16_t filter, uint16_t flags) noexcept;
     void triggerWake() noexcept;
 
@@ -89,14 +102,21 @@ private:
                                std::string ownedBuffer,
                                std::unordered_map<std::string, std::string> headers);
 
+    // Member order is a lifetime contract: members are destroyed in
+    // reverse order, so everything a worker task touches (router_,
+    // rateLimiter_, connectionPool_, proxyManager_, completionMutex_,
+    // completionQueue_, kq_) is declared BEFORE threadPool_, which is
+    // declared last and therefore destroyed (and its workers joined)
+    // first. ~ApiGateway() additionally resets threadPool_ explicitly
+    // before closing kq_ and the sockets.
     uint16_t port_;
     int kq_;
     int listenFd_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> abandoningWork_{false};
 
     Router router_;
     RateLimiter rateLimiter_;
-    ThreadPool threadPool_;
     ConnectionPool connectionPool_;
     ProxyManager proxyManager_;
 
@@ -104,6 +124,8 @@ private:
 
     std::mutex completionMutex_;
     std::queue<CompletionResult> completionQueue_;
+
+    std::unique_ptr<ThreadPool> threadPool_;
 };
 
 }

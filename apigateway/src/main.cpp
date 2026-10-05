@@ -1,35 +1,29 @@
 // src/main.cpp
 #include <csignal>
 #include <cstdlib>
-#include <memory>
+#include <string>
 #include <thread>
 
 #include "ApiGateway.hpp"
 #include "AsyncLogger.hpp"
 
-namespace {
-
-std::unique_ptr<apigateway::ApiGateway> g_gateway;
-
-extern "C" void handleShutdownSignal(int /*signal*/) {
-    if (g_gateway) {
-        g_gateway->stop();
-    }
-}
-
-} 
-
 int main(int argc, char** argv) {
     std::signal(SIGPIPE, SIG_IGN);
-    std::signal(SIGINT, handleShutdownSignal);
-    std::signal(SIGTERM, handleShutdownSignal);
+
+    // SIGINT/SIGTERM are not handled here: ApiGateway registers them with
+    // its kqueue (EVFILT_SIGNAL) and shuts down from the reactor thread.
+
+    // Touch the logger first. Function-local statics are destroyed in
+    // reverse order of construction, so the logger outlives the gateway
+    // (a local below) and every worker thread the gateway owns.
+    apigateway::AsyncLogger& logger = apigateway::AsyncLogger::instance();
 
     uint16_t port = 8080;
     if (argc > 1) {
         const int parsedPort = std::atoi(argv[1]);
         if (parsedPort <= 0 || parsedPort > 65535) {
-            apigateway::AsyncLogger::instance().error(
-                std::string("Invalid port: ") + argv[1]);
+            logger.error(std::string("Invalid port: ") + argv[1]);
+            logger.flush();
             return EXIT_FAILURE;
         }
         port = static_cast<uint16_t>(parsedPort);
@@ -39,9 +33,9 @@ int main(int argc, char** argv) {
     const size_t threadPoolSize = (hwThreads > 0) ? static_cast<size_t>(hwThreads) : 4;
 
     try {
-        g_gateway = std::make_unique<apigateway::ApiGateway>(port, threadPoolSize);
+        apigateway::ApiGateway gateway(port, threadPoolSize);
 
-        apigateway::Router& router = g_gateway->router();
+        apigateway::Router& router = gateway.router();
 
         router.get("/health", [](const apigateway::RouteParams&) {
         });
@@ -80,17 +74,20 @@ int main(int argc, char** argv) {
             "127.0.0.1",
             9000
         );
-        apigateway::AsyncLogger::instance().info(
+        logger.info(
             "API Gateway starting on port " + std::to_string(port) +
             " (thread pool size: " + std::to_string(threadPoolSize) + ")");
 
-        g_gateway->run();
+        gateway.run();
+        // `gateway` is destroyed at the end of this block: workers are
+        // joined, then sockets and the kqueue are closed.
     } catch (const std::exception& ex) {
-        apigateway::AsyncLogger::instance().error(
-            std::string("Fatal error: ") + ex.what());
+        logger.error(std::string("Fatal error: ") + ex.what());
+        logger.flush();
         return EXIT_FAILURE;
     }
 
-    apigateway::AsyncLogger::instance().info("API Gateway shut down cleanly.");
+    logger.info("API Gateway shut down cleanly.");
+    logger.flush();
     return EXIT_SUCCESS;
 }

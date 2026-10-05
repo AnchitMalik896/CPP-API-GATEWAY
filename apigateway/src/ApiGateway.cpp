@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cctype>
 #include <chrono>
+#include <csignal>
 #include <cstring>
 #include <netinet/in.h>
 #include <sstream>
@@ -15,6 +17,7 @@
 #include <sys/event.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 namespace apigateway {
 
@@ -24,9 +27,11 @@ constexpr size_t kReadChunkSize = 16 * 1024;
 constexpr size_t kMaxHeaderSectionLength = 32 * 1024;
 constexpr size_t kMaxBodyLength = 10 * 1024 * 1024;
 constexpr int kMaxEventsPerPoll = 256;
-constexpr long kPollTimeoutNanos = 250'000'000L; 
+constexpr long kPollTimeoutNanos = 250'000'000L;
 
 constexpr uintptr_t kWakeIdent = 1;
+
+constexpr int kShutdownSignals[] = {SIGINT, SIGTERM};
 
 // Pooled upstream connections: how many idle connections we keep around
 // per upstream host:port, and how long an idle connection may sit
@@ -47,7 +52,15 @@ std::string_view trimView(std::string_view s) noexcept {
     return s.substr(begin, end - begin);
 }
 
-} 
+const char* signalName(int signalNumber) noexcept {
+    switch (signalNumber) {
+        case SIGINT:  return "SIGINT";
+        case SIGTERM: return "SIGTERM";
+        default:      return "signal";
+    }
+}
+
+}
 
 
 ApiGateway::ApiGateway(uint16_t port, size_t threadPoolSize)
@@ -55,32 +68,63 @@ ApiGateway::ApiGateway(uint16_t port, size_t threadPoolSize)
     , kq_(kqueue())
     , listenFd_(-1)
     , rateLimiter_(/*capacity=*/500, /*refillRatePerSecond=*/250)
-    , threadPool_(threadPoolSize)
     , connectionPool_(kProxyMaxIdlePerHost, kProxyIdleTimeout)
-    , proxyManager_(connectionPool_) {
+    , proxyManager_(connectionPool_)
+    , threadPool_(std::make_unique<ThreadPool>(threadPoolSize)) {
     if (kq_ < 0) {
         throw std::runtime_error(std::string("kqueue() failed: ") + std::strerror(errno));
     }
 
     try {
         listenFd_ = Socket::createListeningSocket(port_);
+        setupReactorWakeChannel();
+        registerEvent(listenFd_, EVFILT_READ, EV_ADD | EV_ENABLE);
+        setupSignalHandling();
     } catch (...) {
+        restoreSignalDispositions();
+        Socket::closeSocket(listenFd_);
         ::close(kq_);
         throw;
     }
-
-    setupReactorWakeChannel();
-    registerEvent(listenFd_, EVFILT_READ, EV_ADD | EV_ENABLE);
 }
 
 ApiGateway::~ApiGateway() {
+    teardown();
+}
+
+// Deterministic teardown. Order matters:
+//   1. restore default signal dispositions so a second Ctrl-C can force-kill
+//      a gateway that is stuck draining;
+//   2. tell not-yet-started queued tasks to skip their work;
+//   3. destroy the ThreadPool, which joins every worker. Tasks already running
+//      finish normally (they may still use kq_, the completion queue, the
+//      connection pool, the proxy manager and the logger, all alive here);
+//   4. only now, with no thread able to touch them, close the connections,
+//      the listen socket and the kqueue.
+void ApiGateway::teardown() noexcept {
+    restoreSignalDispositions();
+    running_.store(false, std::memory_order_relaxed);
+    abandoningWork_.store(true, std::memory_order_release);
+
+    try {
+        AsyncLogger::instance().info("ApiGateway tearing down: joining worker threads");
+    } catch (...) {
+    }
+
+    threadPool_.reset();
+
     for (auto& [fd, conn] : connections_) {
         (void)conn;
         Socket::closeSocket(fd);
     }
+    connections_.clear();
+
     Socket::closeSocket(listenFd_);
+    listenFd_ = -1;
+
     if (kq_ >= 0) {
         ::close(kq_);
+        kq_ = -1;
     }
 }
 
@@ -101,6 +145,40 @@ void ApiGateway::setupReactorWakeChannel() {
     }
 }
 
+// EVFILT_SIGNAL observes signals even when their disposition is SIG_IGN, so
+// no handler is installed at all: the kernel queues the event on the kqueue
+// and the reactor handles it on its own thread.
+void ApiGateway::setupSignalHandling() {
+    for (const int sig : kShutdownSignals) {
+        if (std::signal(sig, SIG_IGN) == SIG_ERR) {
+            throw std::runtime_error(
+                std::string("signal(SIG_IGN) failed for ") + signalName(sig) + ": " +
+                std::strerror(errno));
+        }
+
+        struct kevent change{};
+        EV_SET(&change, static_cast<uintptr_t>(sig), EVFILT_SIGNAL,
+               EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, nullptr);
+        if (::kevent(kq_, &change, 1, nullptr, 0, nullptr) < 0) {
+            throw std::runtime_error(
+                std::string("kevent() failed to register ") + signalName(sig) + ": " +
+                std::strerror(errno));
+        }
+    }
+}
+
+void ApiGateway::restoreSignalDispositions() noexcept {
+    for (const int sig : kShutdownSignals) {
+        (void)std::signal(sig, SIG_DFL);
+    }
+}
+
+void ApiGateway::onShutdownSignal(int signalNumber) {
+    AsyncLogger::instance().info(
+        std::string("received ") + signalName(signalNumber) + ", shutting down");
+    running_.store(false, std::memory_order_relaxed);
+}
+
 void ApiGateway::triggerWake() noexcept {
     struct kevent change{};
     EV_SET(&change, kWakeIdent, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
@@ -109,7 +187,7 @@ void ApiGateway::triggerWake() noexcept {
 
 void ApiGateway::registerEvent(int fd, int16_t filter, uint16_t flags) noexcept {
     struct kevent change{};
-    
+
     EV_SET(&change, fd, filter, flags | EV_CLEAR, 0, 0, nullptr);
     (void)::kevent(kq_, &change, 1, nullptr, 0, nullptr);
 }
@@ -143,6 +221,11 @@ void ApiGateway::run() {
                 continue;
             }
 
+            if (ev.filter == EVFILT_SIGNAL) {
+                onShutdownSignal(static_cast<int>(ev.ident));
+                continue;
+            }
+
             const int fd = static_cast<int>(ev.ident);
 
             if (fd == listenFd_ && ev.filter == EVFILT_READ) {
@@ -162,7 +245,10 @@ void ApiGateway::run() {
 }
 
 void ApiGateway::stop() noexcept {
-    AsyncLogger::instance().info("ApiGateway shutdown requested");
+    try {
+        AsyncLogger::instance().info("ApiGateway shutdown requested");
+    } catch (...) {
+    }
     running_.store(false, std::memory_order_relaxed);
     triggerWake();
 }
@@ -339,7 +425,7 @@ std::optional<ApiGateway::ParsedRequestView> ApiGateway::tryParseRequest(
     std::string_view raw, size_t& outConsumedBytes) {
     const size_t headerEnd = raw.find("\r\n\r\n");
     if (headerEnd == std::string_view::npos) {
-        return std::nullopt; 
+        return std::nullopt;
     }
 
     const std::string_view headerSection = raw.substr(0, headerEnd);
@@ -413,7 +499,7 @@ std::optional<ApiGateway::ParsedRequestView> ApiGateway::tryParseRequest(
         lineStart = lineEnd + 2;
     }
 
-   
+
     size_t contentLength = 0;
     const std::string_view contentLengthHeader = findHeader(request, "content-length");
     if (!contentLengthHeader.empty()) {
@@ -432,9 +518,9 @@ std::optional<ApiGateway::ParsedRequestView> ApiGateway::tryParseRequest(
         }
     }
 
-    const size_t bodyStart = headerEnd + 4; 
+    const size_t bodyStart = headerEnd + 4;
     if (raw.size() - bodyStart < contentLength) {
-        return std::nullopt; 
+        return std::nullopt;
     }
 
     request.body = raw.substr(bodyStart, contentLength);
@@ -451,61 +537,92 @@ void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, HttpMethod 
                                        std::string ownedBuffer,
                                        std::unordered_map<std::string, std::string> headers) {
 
-    threadPool_.enqueue([this, fd, method, pathOffset, pathLen, queryOffset, queryLen,
+    threadPool_->enqueue([this, fd, method, pathOffset, pathLen, queryOffset, queryLen,
                           bodyOffset, bodyLen, requestId = std::move(requestId),
                           buffer = std::move(ownedBuffer),
                           headers = std::move(headers)]() mutable {
+        // Tasks still queued when teardown begins are dropped without doing
+        // any work: the reactor has already left its loop, so nobody could
+        // deliver the response anyway.
+        if (abandoningWork_.load(std::memory_order_acquire)) {
+            return;
+        }
+
         ScopedRequestId scopedId(requestId);
 
-        const std::string_view raw(buffer);
-        const std::string_view path = raw.substr(pathOffset, pathLen);
-        const std::string_view query = (queryLen > 0) ? raw.substr(queryOffset, queryLen)
-                                                       : std::string_view{};
-        const std::string_view body = (bodyLen > 0) ? raw.substr(bodyOffset, bodyLen)
-                                                     : std::string_view{};
+        // Last-resort 500. If even building it fails, an empty response is
+        // returned: the reactor then closes the connection instead of
+        // leaving it stuck in awaitingCompletion forever.
+        const auto internalError = [](std::string_view what) {
+            try {
+                AsyncLogger::instance().error(
+                    "unhandled exception while processing request: " + std::string(what));
+            } catch (...) {
+            }
+            try {
+                return buildResponse(500, "Internal Server Error",
+                                      "Internal server error",
+                                      "text/plain; charset=utf-8");
+            } catch (...) {
+                return std::string{};
+            }
+        };
 
         std::string responseBytes;
 
-        if (!rateLimiter_.tryAcquire()) {
-            AsyncLogger::instance().warn("rate limit exceeded, path=" + std::string(path));
-            responseBytes = buildResponse(429, "Too Many Requests",
-                                           "Rate limit exceeded. Please try again later.",
-                                           "text/plain; charset=utf-8");
-        } else {
-   
-            const RouteMatch match = router_.match(method, std::string(path));
+        try {
+            const std::string_view raw(buffer);
+            const std::string_view path = raw.substr(pathOffset, pathLen);
+            const std::string_view query = (queryLen > 0) ? raw.substr(queryOffset, queryLen)
+                                                           : std::string_view{};
+            const std::string_view body = (bodyLen > 0) ? raw.substr(bodyOffset, bodyLen)
+                                                         : std::string_view{};
 
-            if (!match.found) {
-                AsyncLogger::instance().info("no route matched, path=" + std::string(path));
-                responseBytes = buildResponse(404, "Not Found",
-                                               "No route matches this path/method.",
+            if (!rateLimiter_.tryAcquire()) {
+                AsyncLogger::instance().warn("rate limit exceeded, path=" + std::string(path));
+                responseBytes = buildResponse(429, "Too Many Requests",
+                                               "Rate limit exceeded. Please try again later.",
                                                "text/plain; charset=utf-8");
-            } else if (match.proxyTarget.has_value()) {
-                responseBytes = proxyManager_.forward(*match.proxyTarget, method, path, query,
-                                                       headers, body, requestId);
-                AsyncLogger::instance().info(
-                    "response ready (proxied), path=" + std::string(path));
             } else {
-                if (match.handler) {
-                    match.handler(match.params);
-                }
 
-                std::ostringstream json;
-                json << "{\"status\":\"ok\",\"path\":\"" << path << "\",\"params\":{";
-                bool first = true;
-                for (const auto& [key, value] : match.params) {
-                    if (!first) {
-                        json << ",";
+                const RouteMatch match = router_.match(method, std::string(path));
+
+                if (!match.found) {
+                    AsyncLogger::instance().info("no route matched, path=" + std::string(path));
+                    responseBytes = buildResponse(404, "Not Found",
+                                                   "No route matches this path/method.",
+                                                   "text/plain; charset=utf-8");
+                } else if (match.proxyTarget.has_value()) {
+                    responseBytes = proxyManager_.forward(*match.proxyTarget, method, path, query,
+                                                           headers, body, requestId);
+                    AsyncLogger::instance().info(
+                        "response ready (proxied), path=" + std::string(path));
+                } else {
+                    if (match.handler) {
+                        match.handler(match.params);
                     }
-                    json << "\"" << key << "\":\"" << value << "\"";
-                    first = false;
-                }
-                json << "}}";
 
-                responseBytes = buildResponse(200, "OK", json.str(), "application/json");
-                AsyncLogger::instance().info(
-                    "response ready, path=" + std::string(path) + " status=200");
+                    std::ostringstream json;
+                    json << "{\"status\":\"ok\",\"path\":\"" << path << "\",\"params\":{";
+                    bool first = true;
+                    for (const auto& [key, value] : match.params) {
+                        if (!first) {
+                            json << ",";
+                        }
+                        json << "\"" << key << "\":\"" << value << "\"";
+                        first = false;
+                    }
+                    json << "}}";
+
+                    responseBytes = buildResponse(200, "OK", json.str(), "application/json");
+                    AsyncLogger::instance().info(
+                        "response ready, path=" + std::string(path) + " status=200");
+                }
             }
+        } catch (const std::exception& ex) {
+            responseBytes = internalError(ex.what());
+        } catch (...) {
+            responseBytes = internalError("non-standard exception");
         }
 
         {
@@ -530,7 +647,7 @@ void ApiGateway::drainCompletionQueue() {
 
         auto it = connections_.find(result.fd);
         if (it == connections_.end()) {
-          
+
             continue;
         }
 
@@ -564,7 +681,7 @@ void ApiGateway::onConnectionWritable(int fd) {
         }
 
         if (bytesSent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return; 
+            return;
         }
         if (bytesSent < 0 && errno == EINTR) {
             continue;
@@ -574,7 +691,7 @@ void ApiGateway::onConnectionWritable(int fd) {
         return;
     }
 
-   
+
     closeConnection(fd);
 }
 
