@@ -53,9 +53,6 @@ set(APIGATEWAY_CORE_SOURCES
     src/RateLimiter.cpp
     src/Router.cpp
     src/Socket.cpp
-    src/EventLoop.cpp
-    src/HttpParser.cpp
-    src/HttpServer.cpp
     src/ThreadPool.cpp
     src/ApiGateway.cpp
     src/AsyncLogger.cpp
