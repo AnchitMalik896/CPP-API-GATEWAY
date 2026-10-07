@@ -1,6 +1,7 @@
 // src/ApiGateway.cpp
 #include "ApiGateway.hpp"
 #include "AsyncLogger.hpp"
+#include "JsonEscape.hpp"
 #include "Socket.hpp"
 
 #include <algorithm>
@@ -24,8 +25,42 @@ namespace apigateway {
 namespace {
 
 constexpr size_t kReadChunkSize = 16 * 1024;
+constexpr size_t kMaxRequestLineLength = 8 * 1024;
 constexpr size_t kMaxHeaderSectionLength = 32 * 1024;
 constexpr size_t kMaxBodyLength = 10 * 1024 * 1024;
+
+// A request violating a size limit. Derives from invalid_argument so any
+// caller that only knows about malformed requests still maps it to 400.
+struct RequestRejected : std::invalid_argument {
+    RequestRejected(int statusCode, std::string_view statusPhrase,
+                    std::string_view responseBody, const char* reason)
+        : std::invalid_argument(reason)
+        , status(statusCode)
+        , phrase(statusPhrase)
+        , body(responseBody) {}
+
+    int status;
+    std::string_view phrase;
+    std::string_view body;
+};
+
+[[noreturn]] void throwRequestLineTooLong() {
+    throw RequestRejected(414, "URI Too Long",
+                           "Request line exceeds maximum allowed length",
+                           "request line too long");
+}
+
+[[noreturn]] void throwHeaderSectionTooLarge() {
+    throw RequestRejected(431, "Request Header Fields Too Large",
+                           "Request headers exceed maximum allowed size",
+                           "header section too large");
+}
+
+[[noreturn]] void throwBodyTooLarge() {
+    throw RequestRejected(413, "Payload Too Large",
+                           "Request exceeds maximum allowed size",
+                           "Content-Length exceeds maximum allowed body size");
+}
 constexpr int kMaxEventsPerPoll = 256;
 constexpr long kPollTimeoutNanos = 250'000'000L;
 
@@ -298,36 +333,21 @@ void ApiGateway::onConnectionReadable(int fd) {
         if (bytesRead > 0) {
             conn.readBuffer.append(buffer.data(), static_cast<size_t>(bytesRead));
 
-            if (conn.readBuffer.size() > kMaxHeaderSectionLength + kMaxBodyLength) {
-                ScopedRequestId scopedId(conn.requestId);
-                AsyncLogger::instance().warn(
-                    "payload too large, fd=" + std::to_string(fd));
-
-                conn.writeBuffer = buildResponse(413, "Payload Too Large",
-                                                  "Request exceeds maximum allowed size",
-                                                  "text/plain; charset=utf-8");
-                conn.writeOffset = 0;
-                registerEvent(fd, EVFILT_READ, EV_DELETE);
-                registerEvent(fd, EVFILT_WRITE, EV_ADD | EV_ENABLE);
-                return;
-            }
-
-            size_t consumedBytes = 0;
             std::optional<ParsedRequestView> parsed;
             try {
-                parsed = tryParseRequest(conn.readBuffer, consumedBytes);
+                if (hasEnoughBytesToParse(conn)) {
+                    size_t requestBytes = 0;
+                    parsed = tryParseRequest(conn.readBuffer, requestBytes);
+                    if (!parsed.has_value() && requestBytes > 0) {
+                        conn.headerParsed = true;
+                        conn.expectedRequestBytes = requestBytes;
+                    }
+                }
+            } catch (const RequestRejected& ex) {
+                rejectRequest(conn, ex.status, ex.phrase, ex.body, ex.what());
+                return;
             } catch (const std::invalid_argument& ex) {
-                ScopedRequestId scopedId(conn.requestId);
-                AsyncLogger::instance().warn(
-                    std::string("malformed request, fd=") + std::to_string(fd) +
-                    " reason=" + ex.what());
-
-                conn.writeBuffer = buildResponse(400, "Bad Request",
-                                                  "Malformed HTTP request",
-                                                  "text/plain; charset=utf-8");
-                conn.writeOffset = 0;
-                registerEvent(fd, EVFILT_READ, EV_DELETE);
-                registerEvent(fd, EVFILT_WRITE, EV_ADD | EV_ENABLE);
+                rejectRequest(conn, 400, "Bad Request", "Malformed HTTP request", ex.what());
                 return;
             }
 
@@ -421,11 +441,51 @@ std::string_view ApiGateway::findHeader(const ParsedRequestView& request,
     return {};
 }
 
+bool ApiGateway::hasEnoughBytesToParse(Connection& conn) {
+    if (conn.headerParsed) {
+        return conn.readBuffer.size() >= conn.expectedRequestBytes;
+    }
+
+    const std::string& buffer = conn.readBuffer;
+    const size_t resumeFrom = conn.headerScanOffset >= 3 ? conn.headerScanOffset - 3 : 0;
+    if (buffer.find("\r\n\r\n", resumeFrom) != std::string::npos) {
+        return true;
+    }
+    conn.headerScanOffset = buffer.size();
+
+    if (buffer.size() > kMaxRequestLineLength + 1 && buffer.find("\r\n") == std::string::npos) {
+        throwRequestLineTooLong();
+    }
+    if (buffer.size() >= kMaxHeaderSectionLength) {
+        throwHeaderSectionTooLarge();
+    }
+    return false;
+}
+
+void ApiGateway::rejectRequest(Connection& conn, int statusCode, std::string_view statusText,
+                                std::string_view body, std::string_view reason) {
+    ScopedRequestId scopedId(conn.requestId);
+    AsyncLogger::instance().warn(
+        "rejecting request, fd=" + std::to_string(conn.fd) +
+        " status=" + std::to_string(statusCode) + " reason=" + std::string(reason));
+
+    conn.writeBuffer = buildResponse(statusCode, statusText, body, "text/plain; charset=utf-8");
+    conn.writeOffset = 0;
+    registerEvent(conn.fd, EVFILT_READ, EV_DELETE);
+    registerEvent(conn.fd, EVFILT_WRITE, EV_ADD | EV_ENABLE);
+}
+
 std::optional<ApiGateway::ParsedRequestView> ApiGateway::tryParseRequest(
-    std::string_view raw, size_t& outConsumedBytes) {
+    std::string_view raw, size_t& outRequestBytes) {
+    outRequestBytes = 0;
+
     const size_t headerEnd = raw.find("\r\n\r\n");
     if (headerEnd == std::string_view::npos) {
         return std::nullopt;
+    }
+
+    if (headerEnd + 4 > kMaxHeaderSectionLength) {
+        throwHeaderSectionTooLarge();
     }
 
     const std::string_view headerSection = raw.substr(0, headerEnd);
@@ -435,6 +495,10 @@ std::optional<ApiGateway::ParsedRequestView> ApiGateway::tryParseRequest(
         (firstLineEnd == std::string_view::npos)
             ? headerSection
             : headerSection.substr(0, firstLineEnd);
+
+    if (requestLine.size() > kMaxRequestLineLength) {
+        throwRequestLineTooLong();
+    }
 
     const size_t firstSpace = requestLine.find(' ');
     if (firstSpace == std::string_view::npos) {
@@ -510,21 +574,23 @@ std::optional<ApiGateway::ParsedRequestView> ApiGateway::tryParseRequest(
         }
         try {
             contentLength = static_cast<size_t>(std::stoul(std::string(contentLengthHeader)));
+        } catch (const std::out_of_range&) {
+            throwBodyTooLarge();
         } catch (const std::exception&) {
             throw std::invalid_argument("Invalid Content-Length value");
         }
         if (contentLength > kMaxBodyLength) {
-            throw std::invalid_argument("Content-Length exceeds maximum allowed body size");
+            throwBodyTooLarge();
         }
     }
 
     const size_t bodyStart = headerEnd + 4;
-    if (raw.size() - bodyStart < contentLength) {
+    outRequestBytes = bodyStart + contentLength;
+    if (raw.size() < outRequestBytes) {
         return std::nullopt;
     }
 
     request.body = raw.substr(bodyStart, contentLength);
-    outConsumedBytes = bodyStart + contentLength;
     return request;
 }
 
@@ -602,19 +668,24 @@ void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, HttpMethod 
                         match.handler(match.params);
                     }
 
-                    std::ostringstream json;
-                    json << "{\"status\":\"ok\",\"path\":\"" << path << "\",\"params\":{";
+                    std::string json = "{\"status\":\"ok\",\"path\":\"";
+                    appendJsonEscaped(json, path);
+                    json += "\",\"params\":{";
                     bool first = true;
                     for (const auto& [key, value] : match.params) {
                         if (!first) {
-                            json << ",";
+                            json += ',';
                         }
-                        json << "\"" << key << "\":\"" << value << "\"";
+                        json += '"';
+                        appendJsonEscaped(json, key);
+                        json += "\":\"";
+                        appendJsonEscaped(json, value);
+                        json += '"';
                         first = false;
                     }
-                    json << "}}";
+                    json += "}}";
 
-                    responseBytes = buildResponse(200, "OK", json.str(), "application/json");
+                    responseBytes = buildResponse(200, "OK", json, "application/json");
                     AsyncLogger::instance().info(
                         "response ready, path=" + std::string(path) + " status=200");
                 }

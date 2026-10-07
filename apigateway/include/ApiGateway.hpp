@@ -47,10 +47,10 @@ private:
         std::string writeBuffer; 
         size_t writeOffset = 0;
         bool awaitingCompletion = false; 
+        size_t headerScanOffset = 0;
         bool headerParsed = false;
-        size_t headerBytesConsumed = 0;
-        size_t contentLength = 0;
-        std::string requestId; 
+        size_t expectedRequestBytes = 0;
+        std::string requestId;
     };
 
     
@@ -83,8 +83,19 @@ private:
     void drainCompletionQueue();
     void closeConnection(int fd) noexcept;
 
+    // Cheap per-chunk gate: resumes the header terminator search where the
+    // previous call stopped and enforces the request-line and header-section
+    // limits while the headers are still arriving. Throws on a violation.
+    static bool hasEnoughBytesToParse(Connection& conn);
+
+    // Parses a buffer whose header terminator has arrived. Returns the request
+    // when complete; otherwise nullopt, with outRequestBytes set to the total
+    // size the request needs (header section + Content-Length).
     static std::optional<ParsedRequestView> tryParseRequest(std::string_view raw,
-                                                             size_t& outConsumedBytes);
+                                                             size_t& outRequestBytes);
+
+    void rejectRequest(Connection& conn, int statusCode, std::string_view statusText,
+                       std::string_view body, std::string_view reason);
 
     static bool caseInsensitiveEquals(std::string_view a, std::string_view b) noexcept;
     static std::string_view findHeader(const ParsedRequestView& request, std::string_view name) noexcept;
