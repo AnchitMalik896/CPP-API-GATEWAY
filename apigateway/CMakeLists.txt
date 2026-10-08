@@ -53,6 +53,7 @@ set(APIGATEWAY_CORE_SOURCES
     src/RateLimiter.cpp
     src/Router.cpp
     src/Socket.cpp
+    src/HttpResponse.cpp
     src/JsonEscape.cpp
     src/ThreadPool.cpp
     src/ApiGateway.cpp

@@ -100,11 +100,6 @@ private:
     static bool caseInsensitiveEquals(std::string_view a, std::string_view b) noexcept;
     static std::string_view findHeader(const ParsedRequestView& request, std::string_view name) noexcept;
 
-    static std::string buildResponse(int statusCode,
-                                      std::string_view statusText,
-                                      std::string_view body,
-                                      std::string_view contentType);
-
    
     void dispatchToThreadPool(int fd, std::string requestId, HttpMethod method,
                                size_t pathOffset, size_t pathLen,

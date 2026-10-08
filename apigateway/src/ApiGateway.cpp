@@ -1,6 +1,8 @@
 // src/ApiGateway.cpp
 #include "ApiGateway.hpp"
 #include "AsyncLogger.hpp"
+#include "HttpRequest.hpp"
+#include "HttpResponse.hpp"
 #include "JsonEscape.hpp"
 #include "Socket.hpp"
 
@@ -60,6 +62,38 @@ struct RequestRejected : std::invalid_argument {
     throw RequestRejected(413, "Payload Too Large",
                            "Request exceeds maximum allowed size",
                            "Content-Length exceeds maximum allowed body size");
+}
+
+HttpResponse textResponse(int statusCode, std::string_view reasonPhrase, std::string_view body) {
+    HttpResponse response;
+    response.setStatus(statusCode, reasonPhrase)
+        .setHeader("Content-Type", "text/plain; charset=utf-8")
+        .setBody(std::string(body));
+    return response;
+}
+
+// Builds the owned request from the buffer the reactor handed over. Path and
+// query are copied; the body is the buffer itself, trimmed in place, so no
+// second allocation is made for it.
+HttpRequest makeRequest(HttpMethod method, std::string buffer,
+                        size_t pathOffset, size_t pathLen,
+                        size_t queryOffset, size_t queryLen,
+                        size_t bodyOffset, size_t bodyLen,
+                        std::unordered_map<std::string, std::string> headers,
+                        std::string requestId) {
+    HttpRequest request;
+    request.method = method;
+    request.path.assign(buffer, pathOffset, pathLen);
+    request.query.assign(buffer, queryOffset, queryLen);
+    request.headers = std::move(headers);
+    request.requestId = std::move(requestId);
+
+    if (bodyLen > 0) {
+        buffer.erase(0, bodyOffset);
+        buffer.resize(bodyLen);
+        request.body = std::move(buffer);
+    }
+    return request;
 }
 constexpr int kMaxEventsPerPoll = 256;
 constexpr long kPollTimeoutNanos = 250'000'000L;
@@ -469,7 +503,7 @@ void ApiGateway::rejectRequest(Connection& conn, int statusCode, std::string_vie
         "rejecting request, fd=" + std::to_string(conn.fd) +
         " status=" + std::to_string(statusCode) + " reason=" + std::string(reason));
 
-    conn.writeBuffer = buildResponse(statusCode, statusText, body, "text/plain; charset=utf-8");
+    conn.writeBuffer = textResponse(statusCode, statusText, body).toBytes();
     conn.writeOffset = 0;
     registerEvent(conn.fd, EVFILT_READ, EV_DELETE);
     registerEvent(conn.fd, EVFILT_WRITE, EV_ADD | EV_ENABLE);
@@ -626,9 +660,8 @@ void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, HttpMethod 
             } catch (...) {
             }
             try {
-                return buildResponse(500, "Internal Server Error",
-                                      "Internal server error",
-                                      "text/plain; charset=utf-8");
+                return textResponse(500, "Internal Server Error", "Internal server error")
+                    .toBytes();
             } catch (...) {
                 return std::string{};
             }
@@ -637,42 +670,44 @@ void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, HttpMethod 
         std::string responseBytes;
 
         try {
-            const std::string_view raw(buffer);
-            const std::string_view path = raw.substr(pathOffset, pathLen);
-            const std::string_view query = (queryLen > 0) ? raw.substr(queryOffset, queryLen)
-                                                           : std::string_view{};
-            const std::string_view body = (bodyLen > 0) ? raw.substr(bodyOffset, bodyLen)
-                                                         : std::string_view{};
+            HttpRequest request = makeRequest(method, std::move(buffer),
+                                               pathOffset, pathLen, queryOffset, queryLen,
+                                               bodyOffset, bodyLen,
+                                               std::move(headers), std::move(requestId));
 
             if (!rateLimiter_.tryAcquire()) {
-                AsyncLogger::instance().warn("rate limit exceeded, path=" + std::string(path));
-                responseBytes = buildResponse(429, "Too Many Requests",
-                                               "Rate limit exceeded. Please try again later.",
-                                               "text/plain; charset=utf-8");
+                AsyncLogger::instance().warn("rate limit exceeded, path=" + request.path);
+                responseBytes = textResponse(429, "Too Many Requests",
+                                              "Rate limit exceeded. Please try again later.")
+                                    .toBytes();
             } else {
 
-                const RouteMatch match = router_.match(method, std::string(path));
+                RouteMatch match = router_.match(request.method, request.path);
 
                 if (!match.found) {
-                    AsyncLogger::instance().info("no route matched, path=" + std::string(path));
-                    responseBytes = buildResponse(404, "Not Found",
-                                                   "No route matches this path/method.",
-                                                   "text/plain; charset=utf-8");
+                    AsyncLogger::instance().info("no route matched, path=" + request.path);
+                    responseBytes = textResponse(404, "Not Found",
+                                                  "No route matches this path/method.")
+                                        .toBytes();
                 } else if (match.proxyTarget.has_value()) {
-                    responseBytes = proxyManager_.forward(*match.proxyTarget, method, path, query,
-                                                           headers, body, requestId);
+                    request.params = std::move(match.params);
+                    responseBytes = proxyManager_.forward(*match.proxyTarget, request.method,
+                                                           request.path, request.query,
+                                                           request.headers, request.body,
+                                                           request.requestId);
                     AsyncLogger::instance().info(
-                        "response ready (proxied), path=" + std::string(path));
+                        "response ready (proxied), path=" + request.path);
                 } else {
+                    request.params = std::move(match.params);
                     if (match.handler) {
-                        match.handler(match.params);
+                        match.handler(request.params);
                     }
 
                     std::string json = "{\"status\":\"ok\",\"path\":\"";
-                    appendJsonEscaped(json, path);
+                    appendJsonEscaped(json, request.path);
                     json += "\",\"params\":{";
                     bool first = true;
-                    for (const auto& [key, value] : match.params) {
+                    for (const auto& [key, value] : request.params) {
                         if (!first) {
                             json += ',';
                         }
@@ -685,9 +720,12 @@ void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, HttpMethod 
                     }
                     json += "}}";
 
-                    responseBytes = buildResponse(200, "OK", json, "application/json");
+                    HttpResponse response;
+                    response.setHeader("Content-Type", "application/json")
+                        .setBody(std::move(json));
+                    responseBytes = response.toBytes();
                     AsyncLogger::instance().info(
-                        "response ready, path=" + std::string(path) + " status=200");
+                        "response ready, path=" + request.path + " status=200");
                 }
             }
         } catch (const std::exception& ex) {
@@ -771,22 +809,6 @@ void ApiGateway::closeConnection(int fd) noexcept {
     registerEvent(fd, EVFILT_WRITE, EV_DELETE);
     Socket::closeSocket(fd);
     connections_.erase(fd);
-}
-
-
-
-std::string ApiGateway::buildResponse(int statusCode,
-                                       std::string_view statusText,
-                                       std::string_view body,
-                                       std::string_view contentType) {
-    std::ostringstream response;
-    response << "HTTP/1.1 " << statusCode << " " << statusText << "\r\n"
-              << "Content-Type: " << contentType << "\r\n"
-              << "Content-Length: " << body.size() << "\r\n"
-              << "Connection: close\r\n"
-              << "\r\n"
-              << body;
-    return response.str();
 }
 
 }
