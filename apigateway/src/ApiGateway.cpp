@@ -15,6 +15,7 @@
 #include <csignal>
 #include <cstring>
 #include <netinet/in.h>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <sys/event.h>
@@ -64,12 +65,32 @@ struct RequestRejected : std::invalid_argument {
                            "Content-Length exceeds maximum allowed body size");
 }
 
-HttpResponse textResponse(int statusCode, std::string_view reasonPhrase, std::string_view body) {
-    HttpResponse response;
+void fillTextResponse(HttpResponse& response, int statusCode, std::string_view reasonPhrase,
+                      std::string_view body) {
     response.setStatus(statusCode, reasonPhrase)
         .setHeader("Content-Type", "text/plain; charset=utf-8")
         .setBody(std::string(body));
+}
+
+HttpResponse textResponse(int statusCode, std::string_view reasonPhrase, std::string_view body) {
+    HttpResponse response;
+    fillTextResponse(response, statusCode, reasonPhrase, body);
     return response;
+}
+
+// Status code of a serialized "HTTP/1.x NNN ..." response, or 0 if it is not one.
+int statusFromWire(std::string_view wire) noexcept {
+    if (wire.size() < 12 || wire.substr(0, 5) != "HTTP/" || wire[8] != ' ') {
+        return 0;
+    }
+    int code = 0;
+    for (size_t i = 9; i < 12; ++i) {
+        if (wire[i] < '0' || wire[i] > '9') {
+            return 0;
+        }
+        code = code * 10 + (wire[i] - '0');
+    }
+    return code >= 100 && code <= 599 ? code : 0;
 }
 
 // Builds the owned request from the buffer the reactor handed over. Path and
@@ -203,6 +224,13 @@ Router& ApiGateway::router() noexcept {
 
 RateLimiter& ApiGateway::rateLimiter() noexcept {
     return rateLimiter_;
+}
+
+void ApiGateway::use(Middleware middleware) {
+    if (running_.load(std::memory_order_relaxed)) {
+        throw std::logic_error("middleware must be registered before run()");
+    }
+    middleware_.add(std::move(middleware));
 }
 
 void ApiGateway::setupReactorWakeChannel() {
@@ -630,6 +658,56 @@ std::optional<ApiGateway::ParsedRequestView> ApiGateway::tryParseRequest(
 
 
 
+void ApiGateway::routeRequest(HttpRequest& request, HttpResponse& response,
+                              std::optional<std::string>& proxiedBytes) {
+    RouteMatch match = router_.match(request.method, request.path);
+
+    if (!match.found) {
+        AsyncLogger::instance().info("no route matched, path=" + request.path);
+        fillTextResponse(response, 404, "Not Found", "No route matches this path/method.");
+        return;
+    }
+
+    request.params = std::move(match.params);
+
+    if (match.proxyTarget.has_value()) {
+        proxiedBytes = proxyManager_.forward(*match.proxyTarget, request.method, request.path,
+                                             request.query, request.headers, request.body,
+                                             request.requestId);
+        if (const int code = statusFromWire(*proxiedBytes); code != 0) {
+            response.setStatus(code);
+        }
+        AsyncLogger::instance().info("response ready (proxied), path=" + request.path);
+        return;
+    }
+
+    if (match.handler) {
+        match.handler(request.params);
+    }
+
+    std::string json = "{\"status\":\"ok\",\"path\":\"";
+    appendJsonEscaped(json, request.path);
+    json += "\",\"params\":{";
+    bool first = true;
+    for (const auto& [key, value] : request.params) {
+        if (!first) {
+            json += ',';
+        }
+        json += '"';
+        appendJsonEscaped(json, key);
+        json += "\":\"";
+        appendJsonEscaped(json, value);
+        json += '"';
+        first = false;
+    }
+    json += "}}";
+
+    response.setStatus(200)
+        .setHeader("Content-Type", "application/json")
+        .setBody(std::move(json));
+    AsyncLogger::instance().info("response ready, path=" + request.path + " status=200");
+}
+
 void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, HttpMethod method,
                                        size_t pathOffset, size_t pathLen,
                                        size_t queryOffset, size_t queryLen,
@@ -681,52 +759,13 @@ void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, HttpMethod 
                                               "Rate limit exceeded. Please try again later.")
                                     .toBytes();
             } else {
-
-                RouteMatch match = router_.match(request.method, request.path);
-
-                if (!match.found) {
-                    AsyncLogger::instance().info("no route matched, path=" + request.path);
-                    responseBytes = textResponse(404, "Not Found",
-                                                  "No route matches this path/method.")
-                                        .toBytes();
-                } else if (match.proxyTarget.has_value()) {
-                    request.params = std::move(match.params);
-                    responseBytes = proxyManager_.forward(*match.proxyTarget, request.method,
-                                                           request.path, request.query,
-                                                           request.headers, request.body,
-                                                           request.requestId);
-                    AsyncLogger::instance().info(
-                        "response ready (proxied), path=" + request.path);
-                } else {
-                    request.params = std::move(match.params);
-                    if (match.handler) {
-                        match.handler(request.params);
-                    }
-
-                    std::string json = "{\"status\":\"ok\",\"path\":\"";
-                    appendJsonEscaped(json, request.path);
-                    json += "\",\"params\":{";
-                    bool first = true;
-                    for (const auto& [key, value] : request.params) {
-                        if (!first) {
-                            json += ',';
-                        }
-                        json += '"';
-                        appendJsonEscaped(json, key);
-                        json += "\":\"";
-                        appendJsonEscaped(json, value);
-                        json += '"';
-                        first = false;
-                    }
-                    json += "}}";
-
-                    HttpResponse response;
-                    response.setHeader("Content-Type", "application/json")
-                        .setBody(std::move(json));
-                    responseBytes = response.toBytes();
-                    AsyncLogger::instance().info(
-                        "response ready, path=" + request.path + " status=200");
-                }
+                HttpResponse response;
+                std::optional<std::string> proxiedBytes;
+                auto terminal = [this, &proxiedBytes](HttpRequest& req, HttpResponse& res) {
+                    routeRequest(req, res, proxiedBytes);
+                };
+                middleware_.run(request, response, terminal);
+                responseBytes = proxiedBytes ? std::move(*proxiedBytes) : response.toBytes();
             }
         } catch (const std::exception& ex) {
             responseBytes = internalError(ex.what());

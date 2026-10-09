@@ -54,6 +54,7 @@ set(APIGATEWAY_CORE_SOURCES
     src/Router.cpp
     src/Socket.cpp
     src/HttpResponse.cpp
+    src/Middleware.cpp
     src/JsonEscape.cpp
     src/ThreadPool.cpp
     src/ApiGateway.cpp

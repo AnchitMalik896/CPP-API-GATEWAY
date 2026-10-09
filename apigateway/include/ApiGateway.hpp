@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "ConnectionPool.hpp"
+#include "Middleware.hpp"
 #include "ProxyManager.hpp"
 #include "RateLimiter.hpp"
 #include "Router.hpp"
@@ -32,6 +33,11 @@ public:
     ApiGateway& operator=(ApiGateway&&) = delete;
     Router& router() noexcept;
     RateLimiter& rateLimiter() noexcept;
+
+    // Appends a middleware; they run in registration order, after the rate
+    // limiter and before routing. Must be called before run(); throws
+    // std::logic_error once the reactor is running.
+    void use(Middleware middleware);
 
     // Runs the reactor until stop() is called or SIGINT/SIGTERM is
     // delivered through the kqueue (EVFILT_SIGNAL).
@@ -94,6 +100,12 @@ private:
     static std::optional<ParsedRequestView> tryParseRequest(std::string_view raw,
                                                              size_t& outRequestBytes);
 
+    // Terminal step of the middleware chain: route match, then proxy or handler.
+    // A proxied reply is pre-serialized by ProxyManager and lands in proxiedBytes;
+    // response then only mirrors its status code.
+    void routeRequest(HttpRequest& request, HttpResponse& response,
+                      std::optional<std::string>& proxiedBytes);
+
     void rejectRequest(Connection& conn, int statusCode, std::string_view statusText,
                        std::string_view body, std::string_view reason);
 
@@ -110,7 +122,8 @@ private:
 
     // Member order is a lifetime contract: members are destroyed in
     // reverse order, so everything a worker task touches (router_,
-    // rateLimiter_, connectionPool_, proxyManager_, completionMutex_,
+    // rateLimiter_, middleware_ (read-only once run() starts),
+    // connectionPool_, proxyManager_, completionMutex_,
     // completionQueue_, kq_) is declared BEFORE threadPool_, which is
     // declared last and therefore destroyed (and its workers joined)
     // first. ~ApiGateway() additionally resets threadPool_ explicitly
@@ -123,6 +136,7 @@ private:
 
     Router router_;
     RateLimiter rateLimiter_;
+    MiddlewarePipeline middleware_;
     ConnectionPool connectionPool_;
     ProxyManager proxyManager_;
 
