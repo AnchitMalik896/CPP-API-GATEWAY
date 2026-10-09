@@ -681,31 +681,35 @@ void ApiGateway::routeRequest(HttpRequest& request, HttpResponse& response,
         return;
     }
 
-    if (match.handler) {
-        match.handler(request.params);
+    if (match.handler != nullptr) {
+        (*match.handler)(request, response);
     }
 
-    std::string json = "{\"status\":\"ok\",\"path\":\"";
-    appendJsonEscaped(json, request.path);
-    json += "\",\"params\":{";
-    bool first = true;
-    for (const auto& [key, value] : request.params) {
-        if (!first) {
-            json += ',';
+    if (match.echoResponse) {
+        std::string json = "{\"status\":\"ok\",\"path\":\"";
+        appendJsonEscaped(json, request.path);
+        json += "\",\"params\":{";
+        bool first = true;
+        for (const auto& [key, value] : request.params) {
+            if (!first) {
+                json += ',';
+            }
+            json += '"';
+            appendJsonEscaped(json, key);
+            json += "\":\"";
+            appendJsonEscaped(json, value);
+            json += '"';
+            first = false;
         }
-        json += '"';
-        appendJsonEscaped(json, key);
-        json += "\":\"";
-        appendJsonEscaped(json, value);
-        json += '"';
-        first = false;
-    }
-    json += "}}";
+        json += "}}";
 
-    response.setStatus(200)
-        .setHeader("Content-Type", "application/json")
-        .setBody(std::move(json));
-    AsyncLogger::instance().info("response ready, path=" + request.path + " status=200");
+        response.setStatus(200)
+            .setHeader("Content-Type", "application/json")
+            .setBody(std::move(json));
+    }
+
+    AsyncLogger::instance().info("response ready, path=" + request.path +
+                                 " status=" + std::to_string(response.status()));
 }
 
 void ApiGateway::dispatchToThreadPool(int fd, std::string requestId, HttpMethod method,

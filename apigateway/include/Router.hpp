@@ -12,6 +12,9 @@
 
 namespace apigateway {
 
+struct HttpRequest;
+class HttpResponse;
+
 enum class HttpMethod {
     GET,
     POST,
@@ -26,7 +29,13 @@ HttpMethod httpMethodFromString(std::string_view method);
 std::string_view httpMethodToString(HttpMethod method) noexcept;
 
 using RouteParams  = std::unordered_map<std::string, std::string>;
-using RouteHandler = std::function<void(const RouteParams& params)>;
+
+// Typed handler: reads the request, fills in the response.
+using RouteHandler  = std::function<void(const HttpRequest&, HttpResponse&)>;
+
+// Params-only handler. The gateway answers such a route with the JSON echo of
+// the path and params once the handler returns.
+using ParamsHandler = std::function<void(const RouteParams& params)>;
 
 struct ProxyTarget {
     std::string host;
@@ -35,7 +44,10 @@ struct ProxyTarget {
 
 struct RouteMatch {
     bool         found = false;
-    RouteHandler handler;
+    // Owned by the router and valid while its routes are not modified, i.e.
+    // for the whole time the gateway is running. Null for proxy routes.
+    const RouteHandler* handler = nullptr;
+    bool         echoResponse = false;
     RouteParams  params;
     std::optional<ProxyTarget> proxyTarget;
 };
@@ -51,12 +63,18 @@ public:
     Router& operator=(Router&&) noexcept;
 
     void addRoute(HttpMethod method, const std::string& path, RouteHandler handler);
+    void addRoute(HttpMethod method, const std::string& path, ParamsHandler handler);
 
     void get(const std::string& path, RouteHandler handler);
+    void get(const std::string& path, ParamsHandler handler);
     void post(const std::string& path, RouteHandler handler);
+    void post(const std::string& path, ParamsHandler handler);
     void put(const std::string& path, RouteHandler handler);
+    void put(const std::string& path, ParamsHandler handler);
     void del(const std::string& path, RouteHandler handler);
+    void del(const std::string& path, ParamsHandler handler);
     void patch(const std::string& path, RouteHandler handler);
+    void patch(const std::string& path, ParamsHandler handler);
 
    
     void addProxyRoute(HttpMethod method, const std::string& path,

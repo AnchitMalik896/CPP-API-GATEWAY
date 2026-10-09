@@ -1,6 +1,9 @@
 // src/Router.cpp
 #include "Router.hpp"
 
+#include "HttpRequest.hpp"
+#include "HttpResponse.hpp"
+
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
@@ -39,6 +42,7 @@ namespace {
 
 struct RouteEntry {
     RouteHandler handler;
+    bool echoResponse = false;
     std::optional<ProxyTarget> proxyTarget;
 };
 
@@ -126,20 +130,40 @@ Router::TrieNode* Router::resolveOrCreateNode(const std::string& path) {
 }
 
 
+namespace {
+
+void addHandlerEntry(auto& node, HttpMethod method, const std::string& path,
+                     RouteEntry entry) {
+    if (node.handlers.count(method) > 0) {
+        throw std::invalid_argument(
+            "Duplicate route registration for method " +
+            std::string(httpMethodToString(method)) + " on path: " + path);
+    }
+    node.handlers.emplace(method, std::move(entry));
+}
+
+}
+
 void Router::addRoute(HttpMethod method, const std::string& path, RouteHandler handler) {
     if (!handler) {
         throw std::invalid_argument("Route handler must not be empty for path: " + path);
     }
 
-    TrieNode* current = resolveOrCreateNode(path);
+    addHandlerEntry(*resolveOrCreateNode(path), method, path,
+                    RouteEntry{std::move(handler), false, std::nullopt});
+}
 
-    if (current->handlers.count(method) > 0) {
-        throw std::invalid_argument(
-            "Duplicate route registration for method " +
-            std::string(httpMethodToString(method)) + " on path: " + path);
+void Router::addRoute(HttpMethod method, const std::string& path, ParamsHandler handler) {
+    if (!handler) {
+        throw std::invalid_argument("Route handler must not be empty for path: " + path);
     }
 
-    current->handlers.emplace(method, RouteEntry{std::move(handler), std::nullopt});
+    RouteHandler typed = [handler = std::move(handler)](const HttpRequest& request,
+                                                        HttpResponse&) {
+        handler(request.params);
+    };
+    addHandlerEntry(*resolveOrCreateNode(path), method, path,
+                    RouteEntry{std::move(typed), true, std::nullopt});
 }
 
 void Router::addProxyRoute(HttpMethod method, const std::string& path,
@@ -157,7 +181,7 @@ void Router::addProxyRoute(HttpMethod method, const std::string& path,
     }
 
     ProxyTarget target{std::move(upstreamHost), upstreamPort};
-    current->handlers.emplace(method, RouteEntry{nullptr, std::move(target)});
+    current->handlers.emplace(method, RouteEntry{nullptr, false, std::move(target)});
 }
 
 void Router::proxy(HttpMethod method, const std::string& path,
@@ -166,19 +190,34 @@ void Router::proxy(HttpMethod method, const std::string& path,
 }
 
 void Router::get(const std::string& path, RouteHandler handler) {
-    addRoute(HttpMethod::GET,    path, std::move(handler));
+    addRoute(HttpMethod::GET, path, std::move(handler));
+}
+void Router::get(const std::string& path, ParamsHandler handler) {
+    addRoute(HttpMethod::GET, path, std::move(handler));
 }
 void Router::post(const std::string& path, RouteHandler handler) {
-    addRoute(HttpMethod::POST,   path, std::move(handler));
+    addRoute(HttpMethod::POST, path, std::move(handler));
+}
+void Router::post(const std::string& path, ParamsHandler handler) {
+    addRoute(HttpMethod::POST, path, std::move(handler));
 }
 void Router::put(const std::string& path, RouteHandler handler) {
-    addRoute(HttpMethod::PUT,    path, std::move(handler));
+    addRoute(HttpMethod::PUT, path, std::move(handler));
+}
+void Router::put(const std::string& path, ParamsHandler handler) {
+    addRoute(HttpMethod::PUT, path, std::move(handler));
 }
 void Router::del(const std::string& path, RouteHandler handler) {
     addRoute(HttpMethod::DELETE, path, std::move(handler));
 }
+void Router::del(const std::string& path, ParamsHandler handler) {
+    addRoute(HttpMethod::DELETE, path, std::move(handler));
+}
 void Router::patch(const std::string& path, RouteHandler handler) {
-    addRoute(HttpMethod::PATCH,  path, std::move(handler));
+    addRoute(HttpMethod::PATCH, path, std::move(handler));
+}
+void Router::patch(const std::string& path, ParamsHandler handler) {
+    addRoute(HttpMethod::PATCH, path, std::move(handler));
 }
 
 
@@ -218,10 +257,12 @@ RouteMatch Router::match(HttpMethod method, const std::string& path) const {
         return result;
     }
 
-    result.found       = true;
-    result.handler      = handlerIt->second.handler;
-    result.params        = std::move(params);
-    result.proxyTarget  = handlerIt->second.proxyTarget;
+    const RouteEntry& entry = handlerIt->second;
+    result.found        = true;
+    result.handler      = entry.proxyTarget.has_value() ? nullptr : &entry.handler;
+    result.echoResponse = entry.echoResponse;
+    result.params       = std::move(params);
+    result.proxyTarget  = entry.proxyTarget;
     return result;
 }
 
